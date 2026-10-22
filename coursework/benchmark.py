@@ -16,6 +16,7 @@ from client import Broker
 from verify import Cluster, ROOT, eventually, healthy, port, stream_state
 
 WORKLOAD = dict(version=3, seed=421, payload=[64, 1024, 16384], producers=[1, 4, 16], consumers=[1, 4, 16], repeats=5, count=64, rates=[10, 100, 500], sweep_seconds=10, stability_seconds=120, outstanding=64, fault_retry_seconds=30, event_limit=131072, readiness_probe_messages=1)
+OUTCOME_ACCOUNTING_VERSION=1
 
 
 class HTTPRejection(RuntimeError):
@@ -26,6 +27,8 @@ class HTTPRejection(RuntimeError):
 
 def safe_error(error):
     """Keep diagnostic classes, never capability/receipt strings or arbitrary server text."""
+    if isinstance(error,urllib.error.HTTPError) and hasattr(error,'_benchmark_safe_detail'):
+        return dict(error._benchmark_safe_detail)
     detail=dict(error_type=type(error).__name__,http_status=getattr(error,'code',None))
     if isinstance(error,urllib.error.HTTPError):
         try:
@@ -36,6 +39,7 @@ def safe_error(error):
         except (OSError,ValueError,AttributeError):
             detail['detail_code']='unparsed'
         finally:error.close()
+        error._benchmark_safe_detail=dict(detail)
     return detail
 
 
@@ -55,6 +59,7 @@ def confirmed_rpc(action,record,phase,*,retry=False,index=None,publisher_id=None
             if phase=='publish' and (not isinstance(result,dict) or type(result.get('sequence')) is not int or result['sequence']<1 or type(result.get('duplicate')) is not bool):
                 raise ValueError('invalid publish acknowledgement')
         except (OSError,ValueError) as error:
+            error._benchmark_rpc_phase=phase
             detail=safe_error(error)
             status=detail['http_status']
             permanent=status is not None and 400<=status<500 and status!=429
@@ -66,6 +71,11 @@ def confirmed_rpc(action,record,phase,*,retry=False,index=None,publisher_id=None
     try:result=eventually(attempt,seconds=WORKLOAD['fault_retry_seconds']) if retry else attempt()
     except AssertionError as error:raise TimeoutError('same-request retry deadline expired; outcome remains uncertain') from error
     return result,attempts
+
+
+def classify_consumer_errors(errors,fault_at):
+    recovered=sum(fault_at is not None and error.get('rpc_phase')=='pull' and error.get('error_type')=='HTTPError' and error.get('http_status')==503 and error.get('detail_code')=='no_responders' and fault_at<=error['at']<=fault_at+WORKLOAD['fault_retry_seconds']+6 for error in errors)
+    return dict(version=OUTCOME_ACCOUNTING_VERSION,recovered_transient_pull_errors=recovered,unexpected_consumer_errors=len(errors)-recovered,scope='Only declared post-kill pull HTTP 503 no_responders within the existing 30-second recovery plus six-second in-flight bound; original errors remain retained. Complete logical-work proofs and owned cleanup are independently required.')
 
 
 def readiness_probe(client,record,proof):
@@ -138,7 +148,7 @@ def cells():
 def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
     cluster = Cluster()
     run = Run(cluster.path / 'benchmark')
-    result = dict(passed=False, cell=cell, rate=rate, fault=fault, backlog=backlog, evidence=str(run.path))
+    result = dict(passed=False, cell=cell, rate=rate, fault=fault, backlog=backlog, evidence=str(run.path),outcome_accounting_version=OUTCOME_ACCOUNTING_VERSION)
     stop, gate = threading.Event(), threading.Event()
     if not backlog:
         gate.set()
@@ -194,7 +204,7 @@ def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
                             condition.notify_all()
                 except Exception as error:
                     with condition:
-                        consumer_errors.append(dict(at=time.perf_counter(), **safe_error(error)))
+                        consumer_errors.append(dict(at=time.perf_counter(),rpc_phase=getattr(error,'_benchmark_rpc_phase',None),**safe_error(error)))
                     if not fault:
                         stop.set()
         for _ in range(cell['consumers']):
@@ -271,7 +281,8 @@ def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
         result['redeliveries'] = sum(d['attempt'] > 1 for v in deliveries.values() for d in v)
         result['after'] = stream_state(cluster)
         result['useful_bytes'] = len(deliveries)*cell['payload']
-        result['passed'] = result['load']['finished'] == count and len(deliveries) == count and not consumer_errors
+        result['logical_work_passed'] = result['load']['finished'] == count and len(accepted) == len(deliveries) == count and not uncertain
+        result['passed'] = result['logical_work_passed']
         if fault:
             after = [d['at'] for v in deliveries.values() for d in v if d['at'] >= result['fault_at']]
             result['first_post_fault_ack_ms'] = 1000*(min(after)-result['fault_at']) if after else None
@@ -290,7 +301,9 @@ def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
         result['request_event_scope']='Detailed readiness and fault events; ordinary measurement retains phase counts and bounded uncertain/rejected events.'
         result['request_event_count']=len(events)
         result['request_event_overflow']=len(events)>=WORKLOAD['event_limit']
-        result['passed'] = result['passed'] and not result['request_event_overflow'] and result['consumer_threads_stopped'] and result['cleanup']['all_exited'] and not result['cleanup']['errors']
+        result['consumer_errors']=consumer_errors
+        result['consumer_fault_classification']=classify_consumer_errors(consumer_errors,result.get('fault_at') if fault else None)
+        result['passed'] = result['passed'] and not result['consumer_fault_classification']['unexpected_consumer_errors'] and not result['request_event_overflow'] and result['consumer_threads_stopped'] and result['cleanup']['all_exited'] and not result['cleanup']['errors']
         save(run.path / 'result.json', result)
     return result
 
@@ -301,7 +314,7 @@ def main():
     args=parser.parse_args()
     assert args.mode == 'smoke' or sys.platform == 'linux', 'isolated Linux runner required'
     directory=ROOT/'.local'/('benchmark-'+args.mode+'-'+str(time.time_ns())); directory.mkdir()
-    summary=dict(passed=False, environment=environment(ROOT), workload=WORKLOAD, mode=args.mode, trials=[])
+    summary=dict(passed=False, environment=environment(ROOT), workload=WORKLOAD, mode=args.mode, trials=[],outcome_accounting_version=OUTCOME_ACCOUNTING_VERSION)
     def run(cell, count=WORKLOAD['count'], rate=None, **flags):
         value=trial(cell,count,rate,profile=args.mode=='profile',**flags)
         summary['trials'].append(value); save(directory/'summary.json',summary)

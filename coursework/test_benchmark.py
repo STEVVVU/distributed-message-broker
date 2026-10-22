@@ -7,7 +7,7 @@ import verify
 import io
 import urllib.error
 import benchmark
-from benchmark import payload, cells, confirmed_rpc, readiness_probe, record_request_event, post_fault_confirmations
+from benchmark import payload, cells, confirmed_rpc, readiness_probe, record_request_event, post_fault_confirmations, safe_error, classify_consumer_errors
 from benchmark_support import quantiles
 
 
@@ -143,6 +143,39 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):confirmed_rpc(action,events.append,'publish')
         self.assertEqual(events[-1]['detail_code'],'no_stream_response')
         self.assertEqual(events[-1]['body_sha256'],'106679462f4b667a6ff79e42ca9e4b7ebbc68ef98517d3cd21a6263e5dccf2d1')
+
+    def test_http_safe_detail_survives_double_call_and_closed_body(self):
+        body=b'{"detail":"nats: no responders available for request","error":"broker operation unavailable","token":"synthetic-secret"}\n'
+        error=urllib.error.HTTPError('http://127.0.0.1/pull',503,'unavailable',{},io.BytesIO(body))
+        error.read=mock.Mock(wraps=error.read)
+        first=safe_error(error);second=safe_error(error)
+        self.assertEqual(first,second)
+        self.assertEqual(first['detail_code'],'no_responders')
+        self.assertNotIn('synthetic-secret',str(first)+str(second))
+        error.read.assert_called_once_with(4096)
+        second['detail_code']='mutated caller copy'
+        self.assertEqual(safe_error(error),first)
+
+    def test_only_declared_bounded_fault_pull_is_recoverable(self):
+        events=[]
+        error=urllib.error.HTTPError('http://127.0.0.1/pull',503,'unavailable',{},io.BytesIO(b'{"detail":"nats: no responders available for request","error":"broker operation unavailable"}\n'))
+        with self.assertRaises(urllib.error.HTTPError):
+            confirmed_rpc(mock.Mock(side_effect=error),events.append,'pull')
+        entry=dict(at=104.0,rpc_phase=error._benchmark_rpc_phase,**safe_error(error))
+        result=classify_consumer_errors([entry],100.0)
+        self.assertEqual((result['recovered_transient_pull_errors'],result['unexpected_consumer_errors']),(1,0))
+        self.assertEqual(entry['body_sha256'],'64c83947c1ba74e67129541f3ef82aed8310372211afd4499b7d281bdc99a2c4')
+        for name,change,fault in [
+            ('ordinary',{},None),('wrong_phase',dict(rpc_phase='ack'),100.0),
+            ('wrong_code',dict(detail_code='nats_timeout'),100.0),('wrong_status',dict(http_status=401),100.0),
+            ('pre_kill',dict(at=99.9),100.0),('outside_bound',dict(at=136.001),100.0),
+            ('corruption',dict(error_type='AssertionError',rpc_phase=None,http_status=None,detail_code=None),100.0),
+            ('unresolved_ack',dict(error_type='TimeoutError',rpc_phase='ack',http_status=None,detail_code=None),100.0)]:
+            with self.subTest(name=name):
+                rejected=classify_consumer_errors([dict(entry,**change)],fault)
+                self.assertEqual((rejected['recovered_transient_pull_errors'],rejected['unexpected_consumer_errors']),(0,1))
+        mixed=classify_consumer_errors([entry,dict(entry,rpc_phase='ack')],100.0)
+        self.assertEqual((mixed['recovered_transient_pull_errors'],mixed['unexpected_consumer_errors']),(1,1))
 
     def test_recovery_excludes_pre_kill_invocations_even_when_retried_after_kill(self):
         def event(phase,index,at):return dict(scope='measurement',phase=phase,index=index,publisher_id=f'bench-{index}',at=at)
