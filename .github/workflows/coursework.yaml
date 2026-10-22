@@ -21,7 +21,7 @@ jobs:
       - run: go test ./server -run '^TestJetStreamConfig(ExplicitZeroLimits|NegativeLimitsFallBackToDynamic)$' -count=1
       - run: go test ./server -run '^TestJetStreamCluster(PubAckSequenceDupe|DoubleAckRedelivery)$' -count=1 -timeout=120s
       - run: python coursework/verify.py
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: broker-proof
