@@ -63,7 +63,7 @@ cluster {{ name: coursework; host: 127.0.0.1; port: {node['route']}; authorizati
 
     def start(self, node):
         log = open(self.path / (node['name'] + '.log'), 'ab')
-        process = subprocess.Popen([str(ROOT / '.local/nats-server.exe'), '-c', str(self.path / (node['name'] + '.conf'))], stdout=log, stderr=log)
+        process = subprocess.Popen([str(ROOT / '.local/nats-server.exe'), '-c', str(self.path / (node['name'] + '.conf'))], stdout=log, stderr=log, start_new_session=os.name != 'nt')
         log.close()
         node['process'] = process
         self.processes.append(process)
