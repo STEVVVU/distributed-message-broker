@@ -25,4 +25,6 @@ The driver's `finally` block terminates only PIDs it started and waits for exit.
 
 ## Helpers
 
+`coursework/benchmark.py` and `coursework/benchmark_support.py` add the [frozen benchmark path](features/benchmark.md). Start with `python coursework/benchmark.py smoke`, then use isolated Linux `benchmark` or separate `profile` mode. The existing correctness driver remains the full fault/semantic baseline.
+
 The maintained driver is `coursework/verify.py`; its invocation above needs Python 3.11 or newer and built executables. See `features/README.md` for feature journeys. Keep the map current with the PStack maintain-verification-skill workflow when behavior changes.

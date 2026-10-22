@@ -1,0 +1,49 @@
+name: Broker benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Isolated benchmark or separate native CPU profile
+        type: choice
+        options: [benchmark, profile]
+        default: benchmark
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GOTOOLCHAIN: local
+      CGO_ENABLED: 0
+      GOMAXPROCS: 2
+      GOMEMLIMIT: 512MiB
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: mkdir -p .local
+      - run: go build -o .local/nats-server.exe .
+      - run: go build -o .local/topic-channel.exe ./coursework/cmd/topic-channel
+      - run: python -m unittest discover -s coursework -p test_benchmark.py -v
+      - run: python coursework/benchmark.py smoke
+      - run: python coursework/benchmark.py ${{ inputs.mode }}
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: broker-benchmark-${{ inputs.mode }}-${{ github.sha }}
+          path: |
+            .local/benchmark-*/summary.json
+            .local/benchmark-*/*.pstats
+            .local/evidence/*/benchmark/*.json
+            .local/evidence/*/benchmark/*.log
+            .local/evidence/*/benchmark/*.pprof
+            .local/evidence/*/*.log
+          include-hidden-files: true
+          retention-days: 14
