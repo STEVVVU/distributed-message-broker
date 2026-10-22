@@ -1,76 +1,57 @@
-<p align="center">
-  <img src="logos/nats-horizontal-color.png" width="300" alt="NATS Logo">
-</p>
+# Distributed message broker
 
-[NATS](https://nats.io) is a simple, secure and performant communications system for digital systems, services and devices. NATS is part of the Cloud Native Computing Foundation ([CNCF](https://cncf.io)). NATS has over [40 client language implementations](https://nats.io/download/), and its server can run on-premise, in the cloud, at the edge, and even on a Raspberry Pi. NATS can secure and simplify design and operation of modern distributed systems.
+A complete NATS JetStream broker with a course-facing HTTP topic/channel API, a Python standard-library client and a repeatable three-process failure/recovery oracle. Topics use three disk-backed replicas. Each durable channel receives the topic independently; workers sharing a channel divide its messages and explicitly acknowledge receipts.
 
-[![License][License-Image]][License-Url] [![Build][Build-Status-Image]][Build-Status-Url] [![Release][Release-Image]][Release-Url] [![Slack][Slack-Image]][Slack-Url] [![Coverage][Coverage-Image]][Coverage-Url] [![Docker Downloads][Docker-Image]][Docker-Url] [![GitHub Downloads][GitHub-Image]][Somsubhra-URL] [![CII Best Practices][CIIBestPractices-Image]][CIIBestPractices-Url] [![Artifact Hub][ArtifactHub-Image]][ArtifactHub-Url]
+This is a licensed adaptation of [NATS server v2.15.1](https://github.com/nats-io/nats-server/releases/tag/v2.15.1), pinned at `b2fd3efc7456b11b06a54877ad6f6ccfb911edb4`. The entire upstream history, implementation, tests, license and notices are retained. [README.upstream.md](README.upstream.md) is the unchanged upstream README. The upstream project owns the broker, Raft replication, storage, recovery and client protocol. The additions here are `coursework/`, its verification skill and documentation, covered by the repository's Apache-2.0 license.
 
-## Documentation
+The coursework connection is Stanford CS244b's [KiraraMQ report](https://www.scs.stanford.edu/24sp-cs244b/projects/KiraraMQ_A_Lightweight_Fault_Tolerant_and_Distributed_Message_Queue.pdf), by Zhemin Huang, Gavin Li, Ericka Liu and Yichun Qian. This adaptation studies its topics, channel fanout, shared consumers and retry semantics using an available licensed production broker. It does not reproduce the unavailable student source, KiraraMQ's etcd discovery or gRPC API. Durable replicated logs and explicit quorum-loss experiments are the extension, drawing on the durable-log design discussed in [Kafka's 2011 paper](https://notes.stephenholiday.com/Kafka.pdf). No university completion, original consensus algorithm or comparative performance claim is made.
 
-- [Official Website](https://nats.io)
-- [Official Documentation](https://docs.nats.io)
-- [FAQ](https://docs.nats.io/reference/faq)
-- Watch [a video overview](https://rethink.synadia.com/episodes/1/) of NATS.
-- Watch [this video from SCALE 13x](https://www.youtube.com/watch?v=sm63oAVPqAM) to learn more about its origin story and design philosophy.
+## Build and verify
 
-## Contact
+Requires Go matching `go.mod` (validated locally with Go 1.27.3), Python 3.11+, no containers, credentials or paid services. The existing `nats.go v1.53.1` dependency is reused without changing module dependencies.
 
-- [Twitter](https://twitter.com/nats_io): Follow us on Twitter!
-- [Google Groups](https://groups.google.com/forum/#!forum/natsio): Where you can ask questions
-- [Slack](https://natsio.slack.com): Click [here](https://slack.nats.io) to join. You can ask questions to our maintainers and to the rich and active community.
+```powershell
+go build -o .local/nats-server.exe .
+go build -o .local/topic-channel.exe ./coursework/cmd/topic-channel
+go test ./coursework/...
+go vet ./coursework/...
+go test ./server -run '^TestJetStreamConfig(ExplicitZeroLimits|NegativeLimitsFallBackToDynamic)$' -count=1
+python coursework/verify.py
+```
 
-## Contributing
+The `.exe` output names also work as executable filenames on Linux. The driver starts three separate loopback processes with owned stores, random ports and random authentication. It exercises HTTP/Python, exits an unacknowledged consumer process, checks redelivery attempts and duplicate publisher IDs, shares a channel between workers, kills the actual stream leader, proves a quorum write, removes another replica and requires bounded write rejection. It restarts the same stores and finally the full cluster. Its accepted-message oracle checks payloads, sequences and durable channel ACK state. A timed-out write is recorded as uncertain rather than counted as acknowledged or lost.
 
-If you are interested in contributing to NATS, read about our...
+Every run retains logs, PIDs, actions, ledger, monitoring snapshots and `result.json` beneath `.local/evidence/`. Cleanup terminates only owned processes and preserves evidence after failures. These local folders include generated cluster capabilities and must remain ignored. CI uploads only logs and proof JSON, never configurations or credentials. The [verification skill](.agents/skills/verify-broker/SKILL.md) and [feature map](.agents/skills/verify-broker/features/README.md) are maintained entry points. Upstream release/external-service workflows remain reference material in `.github/upstream-workflows/`; the bounded active workflow runs the adaptation's checks.
 
-- [Contributing guide](./CONTRIBUTING.md)
-- [Report issues or propose Pull Requests](https://github.com/nats-io)
+## Use the adapter
 
-[License-Url]: https://www.apache.org/licenses/LICENSE-2.0
-[License-Image]: https://img.shields.io/badge/License-Apache2-blue.svg
-[Docker-Image]: https://img.shields.io/docker/pulls/_/nats.svg
-[Docker-Url]: https://hub.docker.com/_/nats
-[Slack-Image]: https://img.shields.io/badge/chat-on%20slack-green
-[Slack-Url]: https://slack.nats.io
-[Fossa-Url]: https://app.fossa.io/projects/git%2Bgithub.com%2Fnats-io%2Fnats-server?ref=badge_shield
-[Fossa-Image]: https://app.fossa.io/api/projects/git%2Bgithub.com%2Fnats-io%2Fnats-server.svg?type=shield
-[Build-Status-Url]: https://github.com/nats-io/nats-server/actions/workflows/tests.yaml
-[Build-Status-Image]: https://github.com/nats-io/nats-server/actions/workflows/tests.yaml/badge.svg?branch=main
-[Release-Url]: https://github.com/nats-io/nats-server/releases/latest
-[Release-Image]: https://img.shields.io/github/v/release/nats-io/nats-server
-[Coverage-Url]: https://coveralls.io/r/nats-io/nats-server?branch=main
-[Coverage-image]: https://coveralls.io/repos/github/nats-io/nats-server/badge.svg?branch=main
-[ReportCard-Url]: https://goreportcard.com/report/nats-io/nats-server
-[ReportCard-Image]: https://goreportcard.com/badge/github.com/nats-io/nats-server
-[CIIBestPractices-Url]: https://bestpractices.coreinfrastructure.org/projects/1895
-[CIIBestPractices-Image]: https://bestpractices.coreinfrastructure.org/projects/1895/badge
-[ArtifactHub-Url]: https://artifacthub.io/packages/helm/nats/nats
-[ArtifactHub-Image]: https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/nats
-[GitHub-Release]: https://github.com/nats-io/nats-server/releases/
-[GitHub-Image]: https://img.shields.io/github/downloads/nats-io/nats-server/total.svg?logo=github
-[Somsubhra-url]: https://somsubhra.github.io/github-release-stats/?username=nats-io&repository=nats-server
+Run three NATS servers using distinct stores, `server_name`s and loopback client/route ports in one JetStream cluster. See generated `.local/evidence/<run>/node*.conf` for complete local configurations. Each has a 64 MiB memory and 128 MiB disk budget. Start each configuration with `.local/nats-server.exe -c PATH`. Set `NATS_TOKEN` to their shared random capability. Generate a separate `BROKER_TOKEN` of at least 32 random characters, retained across adapter restarts.
 
-## Roadmap
+```powershell
+.local/topic-channel.exe -listen 127.0.0.1:8080 -servers nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224
+```
 
-The NATS product roadmap can be found [here](https://nats.io/about/#roadmap).
+```python
+import os, sys
+sys.path.insert(0, 'coursework')
+from client import Broker
+b = Broker('http://127.0.0.1:8080', os.environ['BROKER_TOKEN'])
+b.topic('orders')
+b.channel('orders', 'billing')
+b.publish('orders', 'invoice 42', 'invoice-42')
+for message in b.pull('orders', 'billing'):
+    print(message['sequence'], message['attempt'], message['data'])
+    b.ack('orders', 'billing', message['receipt'])
+```
 
-## Adopters
+All HTTP calls require `Authorization: Bearer <BROKER_TOKEN>`. Operations are `PUT /topics/{topic}`, `PUT /topics/{topic}/channels/{channel}`, `POST /topics/{topic}/messages` with `data` and `publisher_id`, and `POST /topics/{topic}/channels/{channel}/pull` or `/ack` with `receipt`. Names allow 1..48 ASCII letters, digits, underscores or hyphens. Publisher IDs allow the same alphabet up to 96 characters. Creation is idempotent for the fixed configuration. Publish returns sequence and duplicate flag; pull returns zero or one message, stream sequence, delivery attempt and signed receipt.
 
-Who uses NATS? See our [list of users](https://nats.io/#who-uses-nats) on [https://nats.io](https://nats.io).
+## Delivery and resource limits
 
-## Security
+[JetStream pull consumers](https://docs.nats.io/learn/jetstream/pull-consumers) provide shared work and explicit ACK. [Clustered JetStream](https://docs.nats.io/learn/topologies/jetstream-in-a-cluster) owns replicated stream and durable-consumer state. A new channel begins at the first retained message. ACKs do not delete retained messages. Each stream is capped at 100,000 messages or 32 MiB and 64 channels, rejects new messages when full and caps payloads at 32 KiB. Retention management and deletion remain native NATS administration operations.
 
-### Security Audit
+The API has 32 in-flight operations, a 64 KiB JSON body cap, finite HTTP deadlines and a 2-second broker request deadline. Pull waits at most 750 ms. Consumers allow 128 pending acknowledgments. Unacknowledged messages become eligible for retry after 2 seconds. Publisher deduplication lasts 2 minutes; reuse an ID only for the same logical payload. Beyond that window duplicates are possible. Native per-stream sequences are ordered; parallel processing and retries need not finish in sequence order.
 
-A third party security audit was performed by Trail of Bits following engagement by the Open Source Technology Improvement Fund (OSTIF). You can see the [full report from April 2025 here](https://github.com/trailofbits/publications/blob/master/reviews/2025-04-ostif-nats-securityreview.pdf).
+Receipts are HMAC-signed, bound to topic/channel and the configured server-address list, constrained to the generated JetStream ACK namespace and expire after 10 minutes. Use a separate random `BROKER_TOKEN` per deployment. Keep the same server-address list across adapter restarts to preserve receipts. Receipts authorize no arbitrary NATS subjects. A stale delivery's valid ACK follows native JetStream semantics and can acknowledge a message after redelivery; signing does not create exactly-once processing. Keep application side effects idempotent. Changing the capability or address list invalidates existing receipts, allowing ordinary timeout redelivery.
 
-### Reporting Security Vulnerabilities
-
-If you've found a vulnerability or a potential vulnerability in the NATS server, please let us know at
-[nats-security](mailto:security@nats.io).
-
-## License
-
-Unless otherwise noted, the NATS source files are distributed
-under the Apache Version 2.0 license found in the LICENSE file.
+This is a single-tenant local teaching surface. HTTP and NATS addresses must be numeric loopback addresses; there is no remote TLS or tenant authorization layer. Anyone with the capability can use all topics. Native NATS administration bypasses adapter limits and must remain trusted. Process-crash recovery on local stores is tested. Disk failure, power-loss durability, network partitions, cross-host availability and production load remain unverified.

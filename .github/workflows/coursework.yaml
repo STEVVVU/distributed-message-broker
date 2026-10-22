@@ -1,0 +1,32 @@
+name: Topic channel broker verification
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: mkdir -p .local
+      - run: go build -o .local/nats-server.exe .
+      - run: go build -o .local/topic-channel.exe ./coursework/cmd/topic-channel
+      - run: go test ./coursework/... && go vet ./coursework/...
+      - run: go test ./server -run '^TestJetStreamConfig(ExplicitZeroLimits|NegativeLimitsFallBackToDynamic)$' -count=1
+      - run: go test ./server -run '^TestJetStreamCluster(PubAckSequenceDupe|DoubleAckRedelivery)$' -count=1 -timeout=120s
+      - run: python coursework/verify.py
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: broker-proof
+          path: |
+            .local/evidence/**/events.json
+            .local/evidence/**/result.json
+            .local/evidence/**/accepted-ledger.json
+            .local/evidence/**/*.log
