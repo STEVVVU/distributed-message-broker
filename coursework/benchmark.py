@@ -15,7 +15,7 @@ from benchmark_support import Run, environment, load, quantiles, save
 from client import Broker
 from verify import Cluster, ROOT, eventually, healthy, port, stream_state
 
-WORKLOAD = dict(version=2, seed=421, payload=[64, 1024, 16384], producers=[1, 4, 16], consumers=[1, 4, 16], repeats=5, count=64, rates=[10, 100, 500], sweep_seconds=10, stability_seconds=120, outstanding=64, fault_retry_seconds=30, event_limit=131072)
+WORKLOAD = dict(version=3, seed=421, payload=[64, 1024, 16384], producers=[1, 4, 16], consumers=[1, 4, 16], repeats=5, count=64, rates=[10, 100, 500], sweep_seconds=10, stability_seconds=120, outstanding=64, fault_retry_seconds=30, event_limit=131072, readiness_probe_messages=1)
 
 
 class HTTPRejection(RuntimeError):
@@ -32,7 +32,7 @@ def safe_error(error):
             body=error.read(4096)
             detail['body_sha256']=hashlib.sha256(body).hexdigest()
             text=json.loads(body).get('detail','')
-            detail['detail_code']={'nats: timeout':'nats_timeout','nats: no responders available for request':'no_responders','nats: disconnected':'disconnected'}.get(text,'other')
+            detail['detail_code']={'nats: timeout':'nats_timeout','nats: no responders available for request':'no_responders','nats: no response from stream':'no_stream_response','nats: disconnected':'disconnected'}.get(text,'other')
         except (OSError,ValueError,AttributeError):
             detail['detail_code']='unparsed'
         finally:error.close()
@@ -68,6 +68,56 @@ def confirmed_rpc(action,record,phase,*,retry=False,index=None,publisher_id=None
     return result,attempts
 
 
+def readiness_probe(client,record,proof):
+    """Resume one captured publish/pull/ACK journey within the existing readiness bound."""
+    data='readiness|'+proof['publisher_id']
+    proof.update(payload_sha256=hashlib.sha256(data.encode()).hexdigest(),publish_attempts=0,received=0,acknowledged=False)
+    held={}
+    def attempt():
+        if 'sequence' not in proof:
+            proof['publish_attempts']+=1
+            ack,_=confirmed_rpc(lambda:client.publish('orders',data,proof['publisher_id']),record,'publish',publisher_id=proof['publisher_id'])
+            if ack['duplicate'] and proof['publish_attempts']==1:raise RuntimeError('unexpected readiness publisher ID collision')
+            proof['sequence']=ack['sequence']
+        if 'message' not in held:
+            messages,_=confirmed_rpc(lambda:client.pull('orders','bench'),record,'pull')
+            if not messages:raise ValueError('readiness message not yet available')
+            if len(messages)!=1 or messages[0]['data']!=data or messages[0]['sequence']!=proof['sequence']:
+                raise RuntimeError('readiness payload or sequence mismatch')
+            held['message']=messages[0]
+            proof['received']=1
+            record(dict(phase='received',at=time.perf_counter(),sequence=proof['sequence'],sha256=proof['payload_sha256']))
+        receipt=held['message']['receipt']
+        confirmed_rpc(lambda:client.ack('orders','bench',receipt),record,'ack',receipt=receipt)
+        proof['acknowledged']=True
+        return proof
+    return eventually(attempt,seconds=30)
+
+
+def record_request_event(events,phase_counts,event,scope,detailed):
+    counts=phase_counts[scope];phase=event['phase']
+    counts[phase]=counts.get(phase,0)+1
+    if not (scope=='readiness' or detailed or phase.endswith(('_uncertain','_rejected'))):return
+    if len(events)>=WORKLOAD['event_limit']:raise RuntimeError('bounded request event trace overflow')
+    events.append(dict(event,scope=scope))
+
+
+def post_fault_confirmations(events,fault_at):
+    first={}
+    identities={}
+    for event in events:
+        if event.get('scope')=='measurement' and event['phase']=='publish_attempted':
+            key=(event['index'],event['publisher_id'])
+            first[key]=min(first.get(key,event['at']),event['at'])
+            identities.setdefault(event['index'],set()).add(event['publisher_id'])
+    assert all(len(values)==1 for values in identities.values()),'publisher identity changed for one index'
+    eligible={key for key,at in first.items() if at>=fault_at}
+    indices={key[0] for key in eligible}
+    published=[event['at'] for event in events if event.get('scope')=='measurement' and event['phase']=='publish_confirmed' and (event['index'],event['publisher_id']) in eligible]
+    acked=[event['at'] for event in events if event.get('scope')=='measurement' and event['phase']=='ack_confirmed' and event['index'] in indices]
+    return dict(scope='First publish invocation at or after leader kill; repeated attempts retain the same index/publisher identity. ACK index follows exact verified payload receipt.',indices=sorted(indices),first_publish_confirmation_ms=1000*(min(published)-fault_at) if published else None,first_ack_confirmation_ms=1000*(min(acked)-fault_at) if acked else None)
+
+
 def payload(index, size):
     prefix = f'{index:010d}|'
     return prefix + ('abcdefghijklmnopqrstuvwxyz' * ((size+25)//26))[:size-len(prefix)]
@@ -96,12 +146,15 @@ def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
     deliveries, consumer_errors, threads, profiles = {}, [], [], []
     accepted, uncertain = {}, []
     events=[]
+    phase_counts=dict(readiness={},measurement={})
+    warming=True
     def record(event):
         with condition:
-            if len(events)>=WORKLOAD['event_limit']:
+            scope='readiness' if warming else 'measurement'
+            try:record_request_event(events,phase_counts,event,scope,fault)
+            except RuntimeError:
                 stop.set()
-                raise RuntimeError('bounded request event trace overflow')
-            events.append(event)
+                raise
     try:
         for node in cluster.nodes:
             if profile:
@@ -119,6 +172,9 @@ def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
         eventually(lambda: client.channel('orders', 'bench'))
         eventually(lambda: healthy(cluster))
         assert all(p.poll() is None for _, p in run.processes)
+        result['readiness']=dict(publisher_id='readiness-'+secrets.token_hex(16),scope='untimed; included in native stream/consumer counters, excluded from measured offers and latency')
+        readiness_probe(client,record,result['readiness'])
+        warming=False
         result['before'] = stream_state(cluster)
         def consume():
             peer = Broker(client.url, capability)
@@ -208,7 +264,7 @@ def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
         result['delivery_ack_latency_ms'] = quantiles([s['delivery_ack_latency_ms'] for s in result['load']['samples'] if 'delivery_ack_latency_ms' in s])
         result['deliveries'] = deliveries
         result['accepted_publish_ledger'] = accepted
-        result['uncertain_publish_attempts'] = [event for event in events if event['phase']=='publish_uncertain']
+        result['uncertain_publish_attempts'] = [event for event in events if event['scope']=='measurement' and event['phase']=='publish_uncertain']
         result['unresolved_publish_attempts'] = uncertain
         result['consumer_errors'] = consumer_errors
         result['duplicates'] = sum(len(v)-1 for v in deliveries.values())
@@ -219,6 +275,8 @@ def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
         if fault:
             after = [d['at'] for v in deliveries.values() for d in v if d['at'] >= result['fault_at']]
             result['first_post_fault_ack_ms'] = 1000*(min(after)-result['fault_at']) if after else None
+            result['first_post_fault_ack_scope']='Any ACK after the kill, including publishes already in flight before the kill; does not measure newly invoked work recovery.'
+            result['newly_invoked_post_fault']=post_fault_confirmations(events,result['fault_at'])
     except Exception as error:
         result['error'] = repr(error)
     finally:
@@ -228,6 +286,8 @@ def trial(cell, count, rate=None, fault=False, backlog=False, profile=False):
         result['consumer_threads_stopped'] = all(not t.is_alive() for t in threads)
         result['cleanup'] = run.cleanup()
         save(run.path/'request-events.json',events)
+        result['request_phase_counts']=phase_counts
+        result['request_event_scope']='Detailed readiness and fault events; ordinary measurement retains phase counts and bounded uncertain/rejected events.'
         result['request_event_count']=len(events)
         result['request_event_overflow']=len(events)>=WORKLOAD['event_limit']
         result['passed'] = result['passed'] and not result['request_event_overflow'] and result['consumer_threads_stopped'] and result['cleanup']['all_exited'] and not result['cleanup']['errors']
