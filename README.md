@@ -20,6 +20,256 @@ The coursework connection is Stanford CS244b's [KiraraMQ report](https://www.scs
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+Publish the JSON message `event=ready` to an existing topic through the broker's HTTP adapter.
+
+**Trace.** [Build HTTP request and report outcome](#flow-step-client-request) → [Authenticate and bound HTTP work](#flow-step-http-admission) → [Validate and publish with publisher ID](#flow-step-publish) → [Commit through clustered stream and storage](#flow-step-replicate-store).
+
+**Result and boundary.** The adapter authenticates and bounds the request, validates the publish, then commits it through the clustered stream and storage path. Delivery to a durable explicit-ACK channel is a separate request path.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why give the publish operation a publisher identity?** The broker validates publisher identity as part of admission and commits through its clustered stream/storage path, keeping accepted publish state tied to the configured publisher. The tradeoff is that callers must use the broker's configured identity and request contract.
+
+[Windowed publisher-ID deduplication](#technique-windowed-publish-deduplication) · [Replicated streams and durable consumers](#technique-jetstream-replication).
+
+</details>
+
+#### Primary execution flow
+
+Coursework requests enter ServeHTTP after the Python client builds a path. The graph shows admission and operation dispatch, with publish and pull/ACK as distinct branches; verification uses separate owned-process failure and restart checks.
+
+```mermaid
+flowchart TD
+    n8["8. Build HTTP request and report<br/>outcome"]
+    click n8 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-client-request" "Open step, techniques, and source" _top
+    n1["1. Authenticate and bound HTTP<br/>work"]
+    click n1 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-http-admission" "Open step, techniques, and source" _top
+    n2["2. Create file-backed topic<br/>stream"]
+    click n2 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-topic-create" "Open step, techniques, and source" _top
+    n3["3. Validate and publish with<br/>publisher ID"]
+    click n3 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-publish" "Open step, techniques, and source" _top
+    n4["4. Commit through clustered<br/>stream and storage"]
+    click n4 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-replicate-store" "Open step, techniques, and source" _top
+    n5["5. Create durable explicit-ACK<br/>channel"]
+    click n5 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-channel-create" "Open step, techniques, and source" _top
+    n6["6. Pull one channel message"]
+    click n6 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-pull-deliver" "Open step, techniques, and source" _top
+    n7["7. Validate receipt and send<br/>explicit ACK"]
+    click n7 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-receipt-ack" "Open step, techniques, and source" _top
+    n8 -->|"HTTP request"| n1
+    n1 -->|"PUT topic"| n2
+    n1 -->|"POST messages"| n3
+    n3 -->|"JetStream clustered publish"| n4
+    n1 -->|"PUT channel"| n5
+    n1 -->|"POST pull"| n6
+    n6 -->|"client submits returned receipt"| n7
+```
+
+**Detailed workflows.** [Adapter topic and channel requests](#flow-workflow-adapter-requests) · [Verification with owned processes](#flow-workflow-verification).
+
+<a id="flow-workflow-adapter-requests"></a>
+
+<details>
+<summary>Adapter topic and channel requests</summary>
+
+Independent HTTP operations select create, publish, channel creation, pull, or ACK branches after common admission.
+
+```mermaid
+flowchart TD
+    n8["8. Build HTTP request and report<br/>outcome"]
+    click n8 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-client-request" "Open step, techniques, and source" _top
+    n1["1. Authenticate and bound HTTP<br/>work"]
+    click n1 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-http-admission" "Open step, techniques, and source" _top
+    n2["2. Create file-backed topic<br/>stream"]
+    click n2 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-topic-create" "Open step, techniques, and source" _top
+    n3["3. Validate and publish with<br/>publisher ID"]
+    click n3 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-publish" "Open step, techniques, and source" _top
+    n4["4. Commit through clustered<br/>stream and storage"]
+    click n4 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-replicate-store" "Open step, techniques, and source" _top
+    n5["5. Create durable explicit-ACK<br/>channel"]
+    click n5 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-channel-create" "Open step, techniques, and source" _top
+    n6["6. Pull one channel message"]
+    click n6 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-pull-deliver" "Open step, techniques, and source" _top
+    n7["7. Validate receipt and send<br/>explicit ACK"]
+    click n7 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-receipt-ack" "Open step, techniques, and source" _top
+    n8 -->|"HTTP request"| n1
+    n1 -->|"PUT topic"| n2
+    n1 -->|"POST messages"| n3
+    n3 -->|"JetStream clustered publish"| n4
+    n1 -->|"PUT channel"| n5
+    n1 -->|"POST pull"| n6
+    n6 -->|"client submits returned receipt"| n7
+```
+
+</details>
+
+<a id="flow-workflow-verification"></a>
+
+<details>
+<summary>Verification with owned processes</summary>
+
+Independent coursework verification CLI launches processes, drives delivery and ACK checks, and tests restart. Product requests do not launch verification.
+
+```mermaid
+flowchart TD
+    n9["9. Launch owned broker processes"]
+    click n9 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-verify-launch" "Open step, techniques, and source" _top
+    n10["10. Exercise fan-out, shared<br/>work, and failures"]
+    click n10 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-verify-journey" "Open step, techniques, and source" _top
+    n11["11. Restart stores and compare<br/>durable channel state"]
+    click n11 href "https://github.com/STEVVVU/distributed-message-broker#flow-step-verify-restart-oracle" "Open step, techniques, and source" _top
+    n9 -->|"health checks pass and failure<br/>injection is disabled"| n10
+    n10 -->|"after quorum rejection, restart same<br/>stores"| n11
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-http-admission"></a>
+
+##### 1. Authenticate and bound HTTP work
+
+**Component.** coursework HTTP adapter. ServeHTTP compares the bearer capability in constant time, admits at most 32 concurrent requests, validates topic/channel path shape, and returns 401, 429, or 400 before dispatch. The server also sets finite header, read, write, idle, and header-size limits.
+
+**Techniques at this step.** [Bounded HTTP request handling](#technique-bounded-http).
+
+**Source.** [`coursework/cmd/topic-channel/main.go:98`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L98) · [`coursework/cmd/topic-channel/main.go:185`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L185). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-topic-create"></a>
+
+##### 2. Create file-backed topic stream
+
+**Component.** coursework HTTP adapter / JetStream. PUT /topics/{topic} adds stream B_{topic} for course.{topic}, with three replicas, file storage, limits retention, caps of 100000 messages and 32 MiB, DiscardNew, and a two-minute duplicate window.
+
+**Techniques at this step.** [Topic fan-out and channel work sharing](#technique-topic-channel-fanout) · [Replicated streams and durable consumers](#technique-jetstream-replication) · [Bounded retention and delivery backpressure](#technique-bounded-retention-backpressure) · [Windowed publisher-ID deduplication](#technique-windowed-publish-deduplication).
+
+**Source.** [`coursework/cmd/topic-channel/main.go:98`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L98). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-publish"></a>
+
+##### 3. Validate and publish with publisher ID
+
+**Component.** coursework HTTP adapter / JetStream stream. POST messages accepts one bounded JSON object, validates nonempty data up to 32768 bytes and a safe publisher ID, then calls Publish on course.{topic} with MsgId. The response carries stream sequence and duplicate status; broker errors become HTTP 503.
+
+**Techniques at this step.** [Windowed publisher-ID deduplication](#technique-windowed-publish-deduplication) · [Separate acknowledged and uncertain outcomes](#technique-uncertain-outcome-accounting).
+
+**Source.** [`coursework/cmd/topic-channel/main.go:85`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L85) · [`coursework/cmd/topic-channel/main.go:98`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L98) · [`server/stream.go:5619`](https://github.com/STEVVVU/distributed-message-broker/blob/main/server/stream.go#L5619) · [`server/stream.go:5628`](https://github.com/STEVVVU/distributed-message-broker/blob/main/server/stream.go#L5628). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-replicate-store"></a>
+
+##### 4. Commit through clustered stream and storage
+
+**Component.** JetStream stream, Raft, and file store. The clustered inbound path proposes the message to the stream Raft group. Replication and quorum govern acceptance; the file store enforces configured size and retention limits and stores accepted records. This describes inherited broker mechanisms called by the adapter, not coursework consensus code.
+
+**Techniques at this step.** [Replicated streams and durable consumers](#technique-jetstream-replication) · [Bounded retention and delivery backpressure](#technique-bounded-retention-backpressure).
+
+**Source.** [`server/jetstream_cluster.go:13076`](https://github.com/STEVVVU/distributed-message-broker/blob/main/server/jetstream_cluster.go#L13076) · [`server/filestore.go:5630`](https://github.com/STEVVVU/distributed-message-broker/blob/main/server/filestore.go#L5630) · [`server/raft.go:1376`](https://github.com/STEVVVU/distributed-message-broker/blob/main/server/raft.go#L1376). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-channel-create"></a>
+
+##### 5. Create durable explicit-ACK channel
+
+**Component.** coursework HTTP adapter / JetStream consumer. PUT channels adds a durable consumer with explicit ACK, all-message delivery, two-second AckWait, maximum 128 pending ACKs, 32 waiting pulls, batch maximum 16, one-second request expiry, and three replicas.
+
+**Techniques at this step.** [Pull work sharing with explicit ACK](#technique-pull-ack) · [Replicated streams and durable consumers](#technique-jetstream-replication) · [Topic fan-out and channel work sharing](#technique-topic-channel-fanout).
+
+**Source.** [`coursework/cmd/topic-channel/main.go:98`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L98). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-pull-deliver"></a>
+
+##### 6. Pull one channel message
+
+**Component.** coursework HTTP adapter / JetStream consumer. POST pull binds a pull subscription to the named stream and durable, fetches one message with a 750 ms maximum wait, and returns an empty list on timeout. A delivery includes payload, stream sequence, delivery attempt, and a signed receipt; the subscription is then unsubscribed.
+
+**Techniques at this step.** [Pull work sharing with explicit ACK](#technique-pull-ack) · [Topic fan-out and channel work sharing](#technique-topic-channel-fanout).
+
+**Source.** [`coursework/cmd/topic-channel/main.go:98`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L98) · [`server/consumer.go:3441`](https://github.com/STEVVVU/distributed-message-broker/blob/main/server/consumer.go#L3441). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-receipt-ack"></a>
+
+##### 7. Validate receipt and send explicit ACK
+
+**Component.** coursework HTTP adapter / JetStream consumer. The adapter signs receipt fields with HMAC-SHA256. On ACK it checks token size and shape, signature, cluster, topic, channel, expiry, and generated ACK subject prefix, then sends +ACK with a two-second NATS request timeout. Invalid receipts return 400; broker errors return 503.
+
+**Techniques at this step.** [HMAC-bound ACK receipts](#technique-ack-receipt-hmac) · [Pull work sharing with explicit ACK](#technique-pull-ack).
+
+**Source.** [`coursework/cmd/topic-channel/main.go:43`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L43) · [`coursework/cmd/topic-channel/main.go:51`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L51) · [`coursework/cmd/topic-channel/main.go:98`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/cmd/topic-channel/main.go#L98) · [`server/consumer.go:3733`](https://github.com/STEVVVU/distributed-message-broker/blob/main/server/consumer.go#L3733). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-client-request"></a>
+
+##### 8. Build HTTP request and report outcome
+
+**Component.** Python Broker client. Broker constructs topic/channel paths with URL quoting and sends JSON with the bearer capability under a six-second urllib timeout. HTTP errors are observed then raised; successful responses are observed and returned without retrying.
+
+**Techniques at this step.** [Separate acknowledged and uncertain outcomes](#technique-uncertain-outcome-accounting) · [Topic fan-out and channel work sharing](#technique-topic-channel-fanout).
+
+**Source.** [`coursework/client.py:14`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/client.py#L14). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-verify-launch"></a>
+
+##### 9. Launch owned broker processes
+
+**Component.** coursework verification driver. Cluster creates three loopback node configurations with separate stores, starts recorded child processes, and polls health. The finally block terminates only recorded processes and writes result evidence while preserving event logs.
+
+**Techniques at this step.** [Owned-process fault injection and recovery oracles](#technique-owned-process-recovery-oracle).
+
+**Source.** [`coursework/verify.py:38`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/verify.py#L38) · [`coursework/verify.py:96`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/verify.py#L96). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-verify-journey"></a>
+
+##### 10. Exercise fan-out, shared work, and failures
+
+**Component.** coursework verification journey. The journey creates a topic and two channels, publishes and checks duplicate-ID behavior, abandons a delivered billing message and observes redelivery, rejects cross-channel receipt use, and checks that two workers share distinct billing messages. It then kills the leader, accepts a quorum write, removes a second node, and requires a bounded 503 for a no-quorum publish.
+
+**Techniques at this step.** [Owned-process fault injection and recovery oracles](#technique-owned-process-recovery-oracle) · [Separate acknowledged and uncertain outcomes](#technique-uncertain-outcome-accounting) · [Topic fan-out and channel work sharing](#technique-topic-channel-fanout) · [Windowed publisher-ID deduplication](#technique-windowed-publish-deduplication).
+
+**Source.** [`coursework/verify.py:145`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/verify.py#L145). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-verify-restart-oracle"></a>
+
+##### 11. Restart stores and compare durable channel state
+
+**Component.** coursework verification journey. After restarting failed nodes and then the full cluster on the same stores, the driver drains both channels and compares accepted payloads and sequences with its ledger. It excludes the no-quorum request from acknowledged writes because the timed-out or failed request may have committed; this is a verification oracle, not production recovery handling.
+
+**Techniques at this step.** [Owned-process fault injection and recovery oracles](#technique-owned-process-recovery-oracle) · [Separate acknowledged and uncertain outcomes](#technique-uncertain-outcome-accounting) · [Pull work sharing with explicit ACK](#technique-pull-ack) · [Replicated streams and durable consumers](#technique-jetstream-replication).
+
+**Source.** [`coursework/verify.py:207`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/verify.py#L207) · [`coursework/verify.py:64`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/verify.py#L64) · [`coursework/verify.py:72`](https://github.com/STEVVVU/distributed-message-broker/blob/main/coursework/verify.py#L72). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Coursework HTTP adapter and Python client, plus directly invoked inherited JetStream stream, storage, replication, and durable consumer paths and the owned-process verification journey.
+
+- **HTTP adapter security and admission.** Common bearer, concurrency, path and body limits and per-operation adapter handling. [Step 1](#flow-step-http-admission), [Step 2](#flow-step-topic-create), [Step 3](#flow-step-publish), [Step 5](#flow-step-channel-create), [Step 6](#flow-step-pull-deliver), [Step 7](#flow-step-receipt-ack).
+- **Client routing and topic/channel semantics.** Topic subject routing and per-topic durable channels, including fan-out and shared workers in the verification journey. [Step 8](#flow-step-client-request), [Step 2](#flow-step-topic-create), [Step 3](#flow-step-publish), [Step 6](#flow-step-pull-deliver), [Step 10](#flow-step-verify-journey).
+- **Stream persistence, replication, and retention.** Configured limits and dedup window feed inherited clustered stream, Raft, file-store, and restart persistence paths. [Step 2](#flow-step-topic-create), [Step 3](#flow-step-publish), [Step 4](#flow-step-replicate-store), [Step 11](#flow-step-verify-restart-oracle).
+- **Durable consumer delivery and recovery.** Durable explicit ACK configuration, one-at-a-time pull, receipt validation, timeout redelivery and persisted channel state are exercised. [Step 5](#flow-step-channel-create), [Step 6](#flow-step-pull-deliver), [Step 7](#flow-step-receipt-ack), [Step 10](#flow-step-verify-journey), [Step 11](#flow-step-verify-restart-oracle).
+- **Fault injection and result verification.** The driver owns process lifecycle and records accepted, rejected, and uncertain outcomes separately. [Step 9](#flow-step-verify-launch), [Step 10](#flow-step-verify-journey), [Step 11](#flow-step-verify-restart-oracle), [Step 8](#flow-step-client-request).
+
+Outside this flow audit:
+
+- `.github/upstream-workflows`. Inactive upstream release automation; coursework verification does not invoke it.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -48,6 +298,8 @@ flowchart LR
 This repository contains the complete upstream NATS server and its JetStream implementation. The added scope is a Go HTTP adapter, a Python client, and local verification. NATS owns persistence, replication, leader election, stream sequences, and consumer state. The adapter translates a small topic/channel API into JetStream operations.
 
 This boundary map shows how requests reach the inherited broker and its replicated storage.
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>
